@@ -1,0 +1,242 @@
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ─── Core Entities ───
+
+model Event {
+  id              String   @id @default(cuid())
+  ttEventId       String   @unique // Ticket Tailor event ID
+  name            String
+  startDate       DateTime
+  endDate         DateTime?
+  status          String   @default("on_sale") // on_sale, sold_out, completed, cancelled
+  eventType       String   @default("core_quiz") // core_quiz, themed_quiz, core_quiz_bingo, themed_quiz_bingo, standalone_bingo
+  host            String?
+  slot            String?  // prime, late, theme, bingo
+  dayOfWeek       String?
+  ttRawJson       String?  // raw TT response stored as JSON string
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  ticketTypes     TicketType[]
+  orders          Order[]
+  decisions       DecisionLog[]
+  snapshots       EventEconomicsSnapshot[]
+  plannerEntries  PlannerEntry[]
+}
+
+model TicketType {
+  id              String   @id @default(cuid())
+  ttTicketTypeId  String   @unique
+  eventId         String
+  event           Event    @relation(fields: [eventId], references: [id])
+  name            String
+  price           Float    // base price ex-VAT set in TT
+  bookingFee      Float    @default(0.15)
+  quantity        Int      @default(0) // total available
+  sold            Int      @default(0)
+  productCategory String   @default("quiz_team") // quiz_team, bingo_main, bingo_bonus, transaction_fee
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  orderLines      OrderLine[]
+}
+
+model Order {
+  id              String   @id @default(cuid())
+  ttOrderId       String   @unique
+  eventId         String
+  event           Event    @relation(fields: [eventId], references: [id])
+  totalPaid       Float
+  orderDate       DateTime
+  paymentMethod   String?  // STRIPE, PAYPAL, NO_COST, etc.
+  stripeChargeId  String?  // ch_ or py_ ID from Ticket Tailor
+  customerName    String?
+  customerEmail   String?
+  cancelled       Boolean  @default(false)
+  refundedAmount  Float    @default(0)
+  exclusiveTax    Float    @default(0)
+  paygFees        Float    @default(0)
+  ttRawJson       String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  lines           OrderLine[]
+  payments        Payment[]
+}
+
+model OrderLine {
+  id              String   @id @default(cuid())
+  orderId         String
+  order           Order    @relation(fields: [orderId], references: [id])
+  ticketTypeId    String?
+  ticketType      TicketType? @relation(fields: [ticketTypeId], references: [id])
+  description     String
+  quantity        Int      @default(1)
+  unitPrice       Float
+  lineTotal       Float
+  productCategory String   @default("quiz_team")
+  createdAt       DateTime @default(now())
+}
+
+model Payment {
+  id              String   @id @default(cuid())
+  stripeChargeId  String?  @unique
+  orderId         String?
+  order           Order?   @relation(fields: [orderId], references: [id])
+  grossAmount     Float
+  stripeFee       Float    @default(0)
+  netAmount       Float
+  currency        String   @default("gbp")
+  status          String   @default("succeeded") // succeeded, failed, refunded, disputed
+  refundedAmount  Float    @default(0)
+  stripeRawJson   String?
+  matched         Boolean  @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+// ─── Sync ───
+
+model SyncRun {
+  id              String   @id @default(cuid())
+  source          String   // ticket_tailor, stripe
+  status          String   // running, completed, failed
+  eventsProcessed Int      @default(0)
+  ordersProcessed Int      @default(0)
+  paymentsProcessed Int    @default(0)
+  errors          String?  // JSON array of error messages
+  startedAt       DateTime @default(now())
+  completedAt     DateTime?
+}
+
+// ─── Business Rules ───
+
+model AssumptionSet {
+  id                      String   @id @default(cuid())
+  name                    String   @default("default")
+  isActive                Boolean  @default(true)
+
+  // Pricing
+  quizBasePrice           Float    @default(6.00)
+  themedQuizBasePrice     Float    @default(6.00)
+  bonusBingoBasePrice     Float    @default(6.00)
+  bingoMainCardAllIn      Float    @default(15.00)
+  bingoBonusAllIn         Float    @default(6.18)
+
+  // Tax & Fees
+  customerVatRate         Float    @default(0.20)
+  flatRateVat             Float    @default(0.125)
+  stripeFeePercent        Float    @default(0.015)
+  stripeFixedFee          Float    @default(0.20)
+  paygFeePerItem          Float    @default(0.15)
+
+  // Event costs
+  coreQuizAds             Float    @default(25.00)
+  coreQuizActivation      Float    @default(16.20)
+  themedQuizAds           Float    @default(31.20)
+  themedQuizActivation    Float    @default(21.80)
+  themedQuizWriting       Float    @default(35.00)
+  bingoAds                Float    @default(25.00)
+  bingoSoftwareOther      Float    @default(10.00)
+
+  // Host / Licence
+  hostLicencePerMonth     Float    @default(16.00)
+  satBingoEventsPerMonth  Int      @default(4)
+  zoomCostPerHost         Float    @default(0.00)
+
+  // Payout rules
+  hostMinimum             Float    @default(50.00)
+  hostSplitPercent        Float    @default(0.50)
+  leeMinimumAcceptable    Float    @default(25.00)
+
+  // Bingo thresholds
+  bingoTargetPool         Float    @default(100.00)
+  bingoSoftPool           Float    @default(75.00)
+  bingoDefaultPrizeBoard  Float    @default(200.00)
+  bingoConservativeBonus  Float    @default(0.70) // 70% of main buyers forecast to buy bonus
+
+  // Prize ladder (JSON)
+  quizPrizeLadder         String   @default("[{\"minTeams\":0,\"prize\":15},{\"minTeams\":25,\"prize\":20},{\"minTeams\":30,\"prize\":25},{\"minTeams\":35,\"prize\":30},{\"minTeams\":40,\"prize\":35},{\"minTeams\":45,\"prize\":40}]")
+  bingoPrizePerBonus      Float    @default(1.50)
+  bingoPrizeCap           Float    @default(50.00)
+
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+}
+
+model Host {
+  id              String   @id @default(cuid())
+  name            String   @unique
+  isActive        Boolean  @default(true)
+  zoomMonthlyCost Float    @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+model DecisionLog {
+  id              String   @id @default(cuid())
+  eventId         String
+  event           Event    @relation(fields: [eventId], references: [id])
+  decision        String   // run, hold, do_not_run
+  decidedBy       String   @default("system")
+  mainCardsSold   Int?
+  bonusSold       Int?
+  profitPool      Float?
+  hostTake        Float?
+  leeTake         Float?
+  prizeBoard      Float?
+  notes           String?
+  createdAt       DateTime @default(now())
+}
+
+model EventEconomicsSnapshot {
+  id              String   @id @default(cuid())
+  eventId         String
+  event           Event    @relation(fields: [eventId], references: [id])
+  snapshotType    String   @default("live") // live, forecast, final
+  mainSold        Int
+  bonusSold       Int
+  grossCharged    Float
+  flatRateVat     Float
+  stripeFees      Float
+  paygFees        Float
+  netAfterFees    Float
+  ads             Float
+  activation      Float
+  writing         Float
+  licence         Float
+  zoomAlloc       Float
+  otherCosts      Float
+  totalPrize      Float
+  profitPool      Float
+  hostTake        Float
+  leeTake         Float
+  status          String   // run, hold, do_not_run
+  assumptions     String?  // JSON snapshot of assumptions used
+  createdAt       DateTime @default(now())
+}
+
+model PlannerEntry {
+  id              String   @id @default(cuid())
+  eventId         String?
+  event           Event?   @relation(fields: [eventId], references: [id])
+  weekNumber      Int
+  date            DateTime
+  dayOfWeek       String
+  slot            String
+  eventTitle      String
+  host            String?
+  eventType       String
+  targetMain      Int      @default(0)
+  targetBonus     Int      @default(0)
+  notes           String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
